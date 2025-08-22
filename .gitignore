@@ -1,0 +1,19 @@
+# Delphi Ч исключаем временные и бинарные файлы
+*.dcu
+*.obj
+*.tds
+*.res
+*.map
+*.stat
+*.dproj.local
+*.groupproj.local
+*.identcache
+*.tvsconfig
+
+# ѕапки с промежуточными файлами
+Build/
+Bin/
+
+# —истемные
+.DS_Store
+Thumbs.db

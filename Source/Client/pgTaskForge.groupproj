@@ -1,0 +1,60 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{254448F1-1FF3-4F06-B8BD-FDEEFB22E9FE}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="TaskForge.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="..\FileSearch\FileSearch.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="..\ShellExecute\ShellExecute.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="TaskForge">
+        <MSBuild Projects="TaskForge.dproj"/>
+    </Target>
+    <Target Name="TaskForge:Clean">
+        <MSBuild Projects="TaskForge.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="TaskForge:Make">
+        <MSBuild Projects="TaskForge.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="FileSearch">
+        <MSBuild Projects="..\FileSearch\FileSearch.dproj"/>
+    </Target>
+    <Target Name="FileSearch:Clean">
+        <MSBuild Projects="..\FileSearch\FileSearch.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="FileSearch:Make">
+        <MSBuild Projects="..\FileSearch\FileSearch.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="ShellExecute">
+        <MSBuild Projects="..\ShellExecute\ShellExecute.dproj"/>
+    </Target>
+    <Target Name="ShellExecute:Clean">
+        <MSBuild Projects="..\ShellExecute\ShellExecute.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="ShellExecute:Make">
+        <MSBuild Projects="..\ShellExecute\ShellExecute.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="TaskForge;FileSearch;ShellExecute"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="TaskForge:Clean;FileSearch:Clean;ShellExecute:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="TaskForge:Make;FileSearch:Make;ShellExecute:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

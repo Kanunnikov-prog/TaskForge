@@ -1,0 +1,33 @@
+unit SharedTypes;
+
+interface
+
+type
+
+  TTaskInfo = packed record
+    Name: array[0..255] of AnsiChar;
+    Description: array[0..511] of AnsiChar;
+  end;
+
+  TTaskParam = packed record
+    Name: array[0..63] of AnsiChar;
+    Caption: array[0..63] of AnsiChar;
+    DefaultValue: array[0..255] of AnsiChar;
+  end;
+
+  PTaskParam = ^TTaskParam;
+  TTaskParamArray = array of TTaskParam;
+
+  // Колбэк для передачи прогресса и логов из DLL в основное приложение
+  TProgressCallback = function(Percent: Integer; Status, LogLine: PAnsiChar; UserData: Pointer): Boolean; stdcall;
+
+  // Типы функций, которые должны экспортировать DLL-модули
+  TGetTaskCount = function(): Integer; stdcall;
+  TGetTaskInfo = function(Index: Integer): TTaskInfo; stdcall;
+  TGetTaskParams = function(TaskName: PAnsiChar; Buffer: PTaskParam; BufferSize: Integer; out Count: Integer): Boolean; stdcall;
+  TExecuteTask = function(TaskName: PAnsiChar; Params: PAnsiChar; ProgressCallback: TProgressCallback; UserData: Pointer): Boolean; stdcall;
+  TCancelTask = procedure(); stdcall;
+
+implementation
+
+end.

@@ -1,0 +1,661 @@
+library FileSearch;
+
+uses
+  SysUtils, Classes, Windows, Contnrs, Math, SyncObjs, ShLwApi, System.JSON,
+  SharedTypes in '..\..\SharedTypes.pas';
+
+{$R *.res}
+
+type
+  PSearchResult = ^TSearchResult;
+  TSearchResult = record
+    Pattern: string;
+    Positions: TList;
+  end;
+
+var
+  GlobalFoundFiles: TStringList;
+  GlobalResults: TObjectList;
+  GlobalCancelEvent: TEvent;
+
+{
+  Получает значение указанного поля из JSON-данных.
+  @param JSON Строка JSON
+  @param FieldName Имя извлекаемого поля
+  @return Значение поля или пустая строка, если оно отсутствует
+}
+function GetJSONValue(const JSON, FieldName: string): string;
+var
+  JO: TJSONObject;
+  JValue: TJSONValue;
+begin
+  Result := '';
+
+  JO := TJSONObject.ParseJSONValue(JSON) as TJSONObject;
+  if not Assigned(JO) then Exit;
+
+  try
+    JValue := JO.GetValue(FieldName);
+    if not Assigned(JValue) then
+      Exit;
+
+    if JValue is TJSONString then
+      Result := TJSONString(JValue).Value
+    else if JValue is TJSONNumber then
+      Result := TJSONNumber(JValue).Value
+    else if JValue is TJSONTrue then
+      Result := 'true'
+    else if JValue is TJSONFalse then
+      Result := 'false'
+    else if JValue is TJSONNull then
+      Result := 'null'
+    else
+      Result := JValue.ToString;
+
+  finally
+    JO.Free;
+  end;
+end;
+
+{
+  Алгоритм Boyer-Moore-Horspool для быстрого поиска шаблона в буфере.
+  @param PBuf Адрес начала буфера
+  @param BufLen Длина буфера
+  @param Pattern Массив байтов искомого шаблона
+  @return Позицию первой найденной копии шаблона (-1, если не найдено)
+}
+function BMH_Search(PBuf: PByte; BufLen: Integer; const Pattern: TBytes): Integer;
+var
+  Skip: array[0..255] of Integer;
+  PatternLen, i, j, k: Integer;
+begin
+  Result := -1;
+  PatternLen := Length(Pattern);
+
+  // Проверка входных данных
+  if (PatternLen = 0) or (BufLen = 0) or (PatternLen > BufLen) then
+    Exit;
+
+  // Инициализация таблицы сдвигов
+  for i := 0 to 255 do
+    Skip[i] := PatternLen;
+
+  // Заполнение сдвигов для всех символов паттерна, кроме последнего
+  for i := 0 to PatternLen - 2 do
+    Skip[Pattern[i]] := PatternLen - 1 - i;
+
+  // i — позиция конца паттерна в буфере
+  i := PatternLen - 1;
+
+  // Основной цикл поиска
+  while i < BufLen do
+  begin
+    // k — текущая позиция в буфере для сравнения
+    k := i;
+    j := PatternLen - 1;
+
+    // Сравниваем с конца, не изменяя i
+    while (j >= 0) and (k >= 0) and (PBuf[k] = Pattern[j]) do
+    begin
+      Dec(k);
+      Dec(j);
+    end;
+
+    // Если весь паттерн совпал
+    if j < 0 then
+    begin
+      Result := k + 1;  // начало совпадения
+      Exit;
+    end;
+
+    // Проверка границ перед чтением
+    if (k < 0) or (k >= BufLen) then
+      Exit;
+
+    // Сдвигаем i по таблице сдвигов
+    i := i + Skip[PBuf[k]];
+  end;
+end;
+
+{
+  Возвращает количество поддерживаемых задач в библиотеке.
+  @return Целочисленное значение, равное количеству реализованных задач
+}
+function GetTaskCount: Integer; stdcall;
+begin
+  Result := 2;
+end;
+
+{
+  Возвращает описание задачи по указанному индексу.
+  @param Index Индикатор задачи
+  @return Структура с информацией о задаче
+}
+function GetTaskInfo(Index: Integer): TTaskInfo; stdcall;
+var
+  Info: TTaskInfo;
+begin
+  FillChar(Info, SizeOf(Info), 0);
+
+  case Index of
+    0:
+      begin
+        StrPCopy(Info.Name, 'FindFiles');
+        StrPCopy(Info.Description, 'Поиск файлов по маске и папке');
+      end;
+    1:
+      begin
+        StrPCopy(Info.Name, 'SearchInFile');
+        StrPCopy(Info.Description, 'Поиск бинарных последовательностей в файле');
+      end;
+  else
+    // Неверный индекс — возвращаем пустое имя
+    StrPCopy(Info.Name, '');
+  end;
+
+  Result := Info;
+end;
+
+{
+  Возвращает набор параметров для указанной задачи.
+  @param TaskName Имя задачи
+  @param Buffer Указатель на область хранения параметров
+  @param BufferSize Максимальный размер области хранения
+  @param Count Выходной параметр - количество полученных параметров
+  @return True, если параметры были успешно получены
+}
+function GetTaskParams(TaskName: PAnsiChar; Buffer: PTaskParam; BufferSize: Integer; out Count: Integer): Boolean; stdcall;
+var
+  Params: array[0..1] of TTaskParam;
+begin
+  Result := False;
+  FillChar(Params, SizeOf(Params), 0);
+
+  if (TaskName = nil) or (StrLen(TaskName) = 0) then
+    Exit;
+
+  if StrIComp(TaskName, 'FindFiles') = 0 then
+  begin
+    // Параметры: маски и путь
+    StrPCopy(Params[0].Name, 'Masks');
+    StrPCopy(Params[0].Caption, 'Маски (через |)');
+    StrPCopy(Params[0].DefaultValue, '*.txt|*.log');
+
+    StrPCopy(Params[1].Name, 'Path');
+    StrPCopy(Params[1].Caption, 'Папка поиска');
+    StrPCopy(Params[1].DefaultValue, 'C:\Temp');
+
+    Count := 2;
+    Result := True;
+  end
+  else if StrIComp(TaskName, 'SearchInFile') = 0 then
+  begin
+    // Параметры: паттерны, файл, регистр
+    StrPCopy(Params[0].Name, 'Patterns');
+    StrPCopy(Params[0].Caption, 'Паттерны (через |)');
+    StrPCopy(Params[0].DefaultValue, 'libsec|binsec');
+
+    StrPCopy(Params[1].Name, 'FileName');
+    StrPCopy(Params[1].Caption, 'Файл для поиска');
+    StrPCopy(Params[1].DefaultValue, 'C:\Dumps\BigFile.bin');
+
+    Count := 2;
+    Result := True;
+  end;
+
+  Move(Params[0], Buffer^, Count * SizeOf(TTaskParam));
+end;
+
+{
+  Парсит строку, содержащую маски поиска, разделённые символом "|".
+  @param MaskStr Входная строка с масками
+  @return Список строк-маск
+}
+function ParseMasks(const MaskStr: string): TStringList;
+begin
+  Result := TStringList.Create;
+  Result.Delimiter := '|';
+  Result.StrictDelimiter := True;
+  Result.DelimitedText := MaskStr;
+  Result.CaseSensitive := False;
+end;
+
+{
+  Разбирает строку с шаблонами поиска, создавая объекты для каждого шаблона.
+  @param PatternStr Строка с шаблонами, разделённая символом "|"
+  @return Список объектов-шаблонов
+}
+function ParsePatterns(const PatternStr: string): TList;
+var
+  S: string;
+  B: TBytes;
+  P: PSearchResult;
+  List: TStringList;
+begin
+  Result := TList.Create;
+
+  List := TStringList.Create;
+  try
+    List.Delimiter := '|';
+    List.StrictDelimiter := True;
+    List.DelimitedText := PatternStr;
+
+    for S in List do
+    begin
+      if S = '' then Continue;
+      B := TEncoding.ANSI.GetBytes(S);
+      if Length(B) = 0 then Continue;
+
+      New(P);
+      P^.Pattern := S;
+      P^.Positions := TList.Create;
+      Result.Add(P);
+    end;
+  finally
+    List.Free;
+  end;
+end;
+
+{
+  Выполняет задачу поиска файлов по указанным путям и маске.
+  @param Params Строка с параметрами задания
+  @param ProgressCallback Коллбэк-функция для передачи хода выполнения
+  @param UserData Дополнительные данные для коллбэка
+  @return True, если задача была успешно выполнена
+}
+function Task_FindFiles(Params: String; ProgressCallback: TProgressCallback; UserData: Pointer): Boolean;
+var
+  Masks: TStringList;
+  Path: string;
+  FoundCount, TotalFiles, ProcessedFiles: Integer;
+  Status, LogLine: string;
+  Cancelled: Boolean;
+
+  function IsMatchMask(const FileName, Mask: string): Boolean;
+  begin
+    Result := PathMatchSpec(PChar(FileName), PChar(Mask));
+  end;
+
+  // Вспомогательные
+  function CountFilesRecursively(const StartPath: string): Integer;
+  var
+    Mask: String;
+    SearchRec: TSearchRec;
+    SubPath: string;
+  begin
+    Result := 0;
+    SubPath := IncludeTrailingPathDelimiter(StartPath);
+
+    // Считаем файлы в текущей папке по маскам
+    if FindFirst(SubPath + '*', faAnyFile, SearchRec) = 0 then
+    try
+      repeat
+        if (SearchRec.Name = '.') or (SearchRec.Name = '..') then
+          Continue;
+
+        if (SearchRec.Attr and faDirectory) = 0 then
+        begin
+          // Проверяем, подходит ли имя под хотя бы одну маску
+          for Mask in Masks do
+          begin
+            if IsMatchMask(SearchRec.Name, Mask) then
+            begin
+              Inc(Result);
+              Break; // чтобы не учитывать один файл несколько раз
+            end;
+          end;
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      FindClose(SearchRec.FindHandle);
+    end;
+
+    // Рекурсия по подпапкам
+    if FindFirst(SubPath + '*', faDirectory, SearchRec) = 0 then
+    try
+      repeat
+        if (SearchRec.Name = '.') or (SearchRec.Name = '..') then Continue;
+        if (SearchRec.Attr and faDirectory) <> 0 then
+        begin
+          Inc(Result, CountFilesRecursively(SubPath + SearchRec.Name));
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      FindClose(SearchRec.FindHandle);
+    end;
+  end;
+
+  procedure FindFilesRecursively(const StartPath: string);
+  var
+    Mask: String;
+    SearchRec: TSearchRec;
+    SubPath, FullPath: string;
+  begin
+    SubPath := IncludeTrailingPathDelimiter(StartPath);
+
+    // Поиск файлов в текущей папке
+    if FindFirst(SubPath + '*', faAnyFile, SearchRec) = 0 then
+    try
+      repeat
+        if (SearchRec.Name = '.') or (SearchRec.Name = '..') then Continue;
+
+        if (SearchRec.Attr and faDirectory) = 0 then
+        begin
+          // Проверяем соответствие маске
+          for Mask in Masks do
+          begin
+            if IsMatchMask(SearchRec.Name, Mask) then
+            begin
+              FullPath := SubPath + SearchRec.Name;
+              GlobalFoundFiles.Add(FullPath);
+
+              Inc(FoundCount);
+              Inc(ProcessedFiles);
+
+              Status := Format('Найдено: %d', [FoundCount]);
+              LogLine := Format('Файл найден: %s', [FullPath]);
+
+              Cancelled := False;
+              if Assigned(ProgressCallback) then
+                Cancelled := not ProgressCallback(
+                  Trunc(ProcessedFiles * 100.0 / TotalFiles),
+                  PAnsiChar(AnsiString(Status)),
+                  PAnsiChar(AnsiString(LogLine)),
+                  UserData
+                );
+
+              if Cancelled or (GlobalCancelEvent.WaitFor(0) = wrSignaled) then
+                Exit;
+              Sleep(1);
+              Break; // выходим из цикла масок — файл уже учтён
+            end;
+          end;
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      FindClose(SearchRec.FindHandle);
+    end;
+
+    // Рекурсивный обход подпапок
+    if FindFirst(SubPath + '*', faDirectory, SearchRec) = 0 then
+    try
+      repeat
+        if (SearchRec.Name = '.') or (SearchRec.Name = '..') then Continue;
+        if (SearchRec.Attr and faDirectory) <> 0 then
+        begin
+          FindFilesRecursively(SubPath + SearchRec.Name);
+          // Проверка отмены после выхода из рекурсии
+          if Cancelled or (GlobalCancelEvent.WaitFor(0) = wrSignaled) then
+            Exit;
+        end;
+      until FindNext(SearchRec) <> 0;
+    finally
+      FindClose(SearchRec.FindHandle);
+    end;
+  end;
+
+begin
+  Result := False;
+  FoundCount := 0;
+  ProcessedFiles := 0;
+  Cancelled := False;
+
+  Masks := ParseMasks(GetJSONValue(Params, 'Masks'));
+  Path := Trim(GetJSONValue(Params, 'Path'));
+  if (Masks.Count = 0) or (Path = '') or (not DirectoryExists(Path)) then
+  begin
+    Masks.Free;
+    Exit;
+  end;
+
+  Path := IncludeTrailingPathDelimiter(Path);
+  GlobalFoundFiles.Clear;
+
+  try
+    // 1. Оценка общего количества файлов (по маскам, рекурсивно)
+    TotalFiles := CountFilesRecursively(Path);
+    if TotalFiles = 0 then
+      TotalFiles := 1; // чтобы избежать деления на 0
+
+    // 2. Основной поиск
+    FindFilesRecursively(Path);
+
+    // Если отмена — выходим
+    if Cancelled or (GlobalCancelEvent.WaitFor(0) = wrSignaled) then
+      Exit;
+
+    // 3. Финальный callback
+    if Assigned(ProgressCallback) then
+    begin
+      Status := 'Поиск завершён';
+      LogLine := Format('Найдено файлов: %d', [FoundCount]);
+      ProgressCallback(100, PAnsiChar(AnsiString(Status)), PAnsiChar(AnsiString(LogLine)), UserData);
+    end;
+
+    Result := True;
+  finally
+    Masks.Free;
+  end;
+end;
+
+{
+  Реализует задачу поиска двоичных последовательностей в указанном файле.
+  @param Params Строка с параметрами задания
+  @param ProgressCallback Коллбэк-функция для передачи хода выполнения
+  @param UserData Дополнительные данные для коллбэка
+  @return True, если задача была успешно выполнена
+}
+function Task_SearchInFile(Params: String; ProgressCallback: TProgressCallback; UserData: Pointer): Boolean;
+var
+  Patterns: TList;
+  FileName: string;
+  FileStream: TFileStream;
+  Buffer: TBytes;
+  BufferSize, ReadBytes: Integer;
+  Pattern: PSearchResult;
+  i, j, SearchPos, FoundPos: Integer;
+  TotalRead, FileSize: Int64;
+  Status, LogLine: string;
+  Cancelled: Boolean;
+  MaxPatternLen, Overlap: Integer;
+  PatternBytes: TBytes;
+  GlobalPos: Int64;
+  PosPtr: PInteger;
+  TotalMatches: Int64;
+begin
+  Result := False;
+
+  Patterns := ParsePatterns(GetJSONValue(Params, 'Patterns'));
+  FileName := GetJSONValue(Params, 'FileName');
+  try
+    try
+      if (Patterns.Count = 0) or (not FileExists(FileName)) then
+      begin
+        Patterns.Free;
+        Exit;
+      end;
+
+      FileStream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+      FileSize := FileStream.Size;
+
+      if FileSize = 0 then Exit;
+
+      // Буфер ~256KB
+      BufferSize := Min(256 * 1024, FileSize);
+      SetLength(Buffer, BufferSize);
+
+      // Максимальная длина паттерна
+      MaxPatternLen := 0;
+      for i := 0 to Patterns.Count - 1 do
+      begin
+        Pattern := PSearchResult(Patterns[i]);
+        if Length(TEncoding.ANSI.GetBytes(Pattern.Pattern)) > MaxPatternLen then
+          MaxPatternLen := Length(TEncoding.ANSI.GetBytes(Pattern.Pattern));
+      end;
+      Overlap := Max(1, MaxPatternLen - 1);
+
+      TotalRead := 0;
+      GlobalResults.Clear;
+
+      while FileStream.Position < FileStream.Size do
+      begin
+        ReadBytes := FileStream.Read(Buffer[0], BufferSize);
+        if ReadBytes = 0 then
+          Break;
+
+        // Проверка отмены
+        Cancelled := False;
+        if Assigned(ProgressCallback) then
+        begin
+          Status := Format('Чтение: %d%%', [Min(Trunc(TotalRead * 100.0 / FileSize), 99)]);
+          Cancelled := not ProgressCallback(
+            Min(Trunc(TotalRead * 100.0 / FileSize), 99),
+            PAnsiChar(AnsiString(Status)),
+            nil,
+            UserData
+          );
+        end;
+
+        if Cancelled or (GlobalCancelEvent.WaitFor(0) = wrSignaled) then
+          Exit;
+
+        // Поиск каждого паттерна
+        for i := 0 to Patterns.Count - 1 do
+        begin
+          Pattern := PSearchResult(Patterns[i]);
+          PatternBytes := TEncoding.ANSI.GetBytes(Pattern.Pattern);
+
+          SearchPos := 0;
+          while SearchPos <= ReadBytes - Length(PatternBytes) do
+          begin
+            FoundPos := BMH_Search(PByte(@Buffer[0]) + SearchPos, ReadBytes - SearchPos, PatternBytes);
+            if FoundPos = -1 then
+              Break;
+
+            GlobalPos := TotalRead + SearchPos + FoundPos;
+            New(PosPtr);
+            PosPtr^ := GlobalPos;
+            Pattern.Positions.Add(PosPtr);
+
+            SearchPos := SearchPos + FoundPos + 1;
+          end;
+        end;
+
+        Inc(TotalRead, ReadBytes);
+        if FileStream.Position < FileStream.Size then
+          FileStream.Seek(-Overlap, soFromCurrent);
+      end;
+
+      // Завершение — детальный отчёт
+      if Assigned(ProgressCallback) then
+      begin
+        TotalMatches := 0;
+        for i := 0 to Patterns.Count - 1 do
+          Inc(TotalMatches, PSearchResult(Patterns[i]).Positions.Count);
+
+        Status := 'Поиск в файле завершён';
+        LogLine := Format('Найдено вхождений: %d'#13#10, [TotalMatches]);
+
+        for i := 0 to Patterns.Count - 1 do
+        begin
+          Pattern := PSearchResult(Patterns[i]);
+          if Pattern.Positions.Count = 0 then
+          begin
+            LogLine := LogLine + Format('"%s": не найдено'#13#10, [Pattern.Pattern])
+          end
+          else
+          begin
+            LogLine := LogLine + Format('"%s": %d вх. позиции: ', [Pattern.Pattern, Pattern.Positions.Count]);
+            for j := 0 to Min(Pattern.Positions.Count - 1, 9) do
+            begin
+              PosPtr := Pattern.Positions[j];
+              if j > 0 then
+                LogLine := LogLine + ', ';
+              LogLine := LogLine + IntToStr(PosPtr^);
+            end;
+            if Pattern.Positions.Count > 10 then
+              LogLine := LogLine + '...';
+            LogLine := LogLine + #13#10;
+          end;
+        end;
+
+        // Убираем лишний перенос строки в конце
+        if (Length(LogLine) >= 2) and (Copy(LogLine, Length(LogLine) - 1, 2) = #13#10) then
+          SetLength(LogLine, Length(LogLine) - 2);
+
+        ProgressCallback(100, PAnsiChar(AnsiString(Status)), PAnsiChar(AnsiString(LogLine)), UserData);
+      end;
+
+      Result := True;
+
+    except
+      on E: Exception do
+      begin
+        if Assigned(ProgressCallback) then
+        begin
+          Status := 'Ошибка при поиске';
+          LogLine := E.Message;
+          ProgressCallback(100, PAnsiChar(AnsiString(Status)), PAnsiChar(AnsiString(LogLine)), UserData);
+        end;
+      end;
+    end;
+  finally
+    // Очистка всех данных
+    for i := 0 to Patterns.Count - 1 do
+    begin
+      Pattern := PSearchResult(Patterns[i]);
+
+      // Освобождаем список позиций
+      for j := 0 to Pattern.Positions.Count - 1 do
+      begin
+        PosPtr := Pattern.Positions[j];
+        Dispose(PosPtr); // PInteger
+      end;
+      Pattern.Positions.Free;
+
+      // Освобождаем саму запись
+      Dispose(Pattern);
+    end;
+    Patterns.Free;
+
+    // Закрываем файл
+    if Assigned(FileStream) then
+      FileStream.Free;
+  end;
+end;
+
+{
+  Определяет и выполняет нужную задачу согласно переданному названию.
+  @param TaskName Имя нужной задачи
+  @param Params Строка с параметрами задания
+  @param ProgressCallback Коллбэк-функция для передачи хода выполнения
+  @param UserData Дополнительные данные для коллбэка
+  @return True, если задача была успешно выполнена
+}
+function ExecuteTask(TaskName: PAnsiChar; Params: PAnsiChar; ProgressCallback: TProgressCallback; UserData: Pointer): Boolean; stdcall;
+var
+  Task: string;
+begin
+  Result := False;
+  if (TaskName = nil) or (StrLen(TaskName) = 0) then
+    Exit;
+  if (Params = nil) or not Assigned(ProgressCallback) then
+    Exit;
+  Task := string(TaskName);
+  if Task = 'FindFiles' then
+    Result := Task_FindFiles(string(Params), ProgressCallback, UserData)
+  else if Task = 'SearchInFile' then
+    Result := Task_SearchInFile(string(Params), ProgressCallback, UserData);
+end;
+
+exports
+  GetTaskCount,
+  GetTaskInfo,
+  GetTaskParams,
+  ExecuteTask;
+
+begin
+  GlobalFoundFiles := TStringList.Create;
+  GlobalResults := TObjectList.Create(True);
+  GlobalCancelEvent := TEvent.Create(nil, True, False, '');
+end.
