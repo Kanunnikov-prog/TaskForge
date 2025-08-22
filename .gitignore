@@ -9,6 +9,8 @@
 *.groupproj.local
 *.identcache
 *.tvsconfig
+__history/
+__recovery/
 
 # Папки с промежуточными файлами
 Build/
@@ -17,3 +19,4 @@ Bin/
 # Системные
 .DS_Store
 Thumbs.db
+Desktop.ini
